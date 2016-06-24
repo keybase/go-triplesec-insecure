@@ -76,7 +76,7 @@ func (c *Cipher) DeriveKey(extra int) ([]byte, []byte, error) {
 	dkLen := DkLen + extra
 
 	if c.derivedKey == nil || len(c.derivedKey) < dkLen {
-		dk, err := scrypt.Key(c.passphrase, c.salt, 32768, 8, 1, dkLen)
+		dk, err := scrypt.Key(c.passphrase, c.salt, 2, 8, 1, dkLen)
 		if err != nil {
 			return nil, nil, err
 		}
