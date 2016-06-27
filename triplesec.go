@@ -112,7 +112,7 @@ var Version uint32 = 3
 
 const MacOutputLen = 64
 
-var (
+const (
 	macKeyLen    = 48
 	cipherKeyLen = 32
 	IVLen        = 16
