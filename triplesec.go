@@ -89,9 +89,9 @@ func (c *Cipher) DeriveKey(extra int) ([]byte, []byte, error) {
 		//    NOW SEE THIS
 		//
 		// We're giving a very insecure and degraded value of N here
-		// at N=1; we typically run with N=2^15, but we want to make this
+		// at N=2; we typically run with N=2^15, but we want to make this
 		// fork of Triplesec intentionally weak so our tests run faster.
-		// So the second paramenter of scrypt.Key() is set to N=1
+		// So the second paramenter of scrypt.Key() is set to N=2
 		//
 		// XXX XXX XXX XXXX XXXX XXXXX
 		insecureNValue := 2
