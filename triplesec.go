@@ -38,8 +38,15 @@ func scrub(b []byte) {
 }
 
 // A Cipher is an instance of TripleSec using a particular key and
-// a particular salt
-func NewCipher(passphrase []byte, salt []byte) (*Cipher, error) {
+// a particular salt. Because this is insecure triplesec used only for
+// testing, you must pass it a function that prints an ugly warning, and
+// one that says if we're in production mode.  If the later return true,
+// we will panic the program.
+func NewCipher(passphrase []byte, salt []byte, functionThatPrintsUglyWarnings func(), isProduction func() bool) (*Cipher, error) {
+	functionThatPrintsUglyWarnings()
+	if isProduction() {
+		panic("refusing to run insecure triplesec in production")
+	}
 	if salt != nil && len(salt) != SaltLen {
 		return nil, fmt.Errorf("Need a salt of size %d", SaltLen)
 	}
