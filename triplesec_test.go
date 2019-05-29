@@ -203,17 +203,6 @@ func TestBadPwV4(t *testing.T) {
 	}
 }
 
-type vector struct {
-	Key string `json:"key"`
-	Pt  string `json:"pt"`
-	Ct  string `json:"ct"`
-	R   string `json:"r"`
-}
-
-type testVectors struct {
-	Vectors []vector `json:"vectors"`
-}
-
 func TestRandomness(t *testing.T) {
 	for _, version := range []Version{3, 4} {
 		key := []byte("YELLOW_SUBMARINE")
