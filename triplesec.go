@@ -20,9 +20,8 @@ import (
 
 	"golang.org/x/crypto/salsa20"
 	"golang.org/x/crypto/scrypt"
+	"golang.org/x/crypto/sha3"
 	"golang.org/x/crypto/twofish" //nolint
-
-	"github.com/keybase/go-crypto/sha3"
 )
 
 type RandomnessGenerator interface {
