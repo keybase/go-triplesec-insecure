@@ -63,6 +63,16 @@ const (
 	MacOutputLen    = 64
 	MacKeyLen       = 48
 	CipherKeyLen    = 32
+
+	// MaxDeriveKeyExtra is the maximum number of additional bytes callers may
+	// request from DeriveKey. Known production callers require at most 128
+	// bytes; the larger limit leaves room for future uses while bounding memory.
+	MaxDeriveKeyExtra = 1024
+
+	// The only supported cross-version difference is the additional Twofish
+	// key present in v3. Keep this internal bound separate from the exported
+	// DeriveKey API, which may be used as a general KDF by callers.
+	maxCrossVersionKeyExtra = CipherKeyLen
 )
 
 type Version uint32
@@ -125,13 +135,20 @@ func scrub(b []byte) {
 // one that says if we're in production mode.  If the later return true,
 // we will panic the program.
 // NewCipher makes an instance of TripleSec using a particular key and
-// a particular salt
+// a particular salt. It copies the passphrase and salt.
 func NewCipher(passphrase []byte, salt []byte, version Version, functionThatPrintsUglyWarnings func(), isProduction func() bool) (*Cipher, error) {
 	return NewCipherWithRng(passphrase, salt, version, NewCryptoRandGenerator(), functionThatPrintsUglyWarnings, isProduction)
 }
 
 // NewCipherWithRng makes an instance of TripleSec using a particular key and
-// a particular salt and uses a given randomness stream
+// a particular salt and uses a given randomness stream.
+//
+// WARNING: The rng parameter must be a cryptographically secure random number
+// generator (CSPRNG). Using a deterministic or low-entropy generator will
+// destroy confidentiality due to IV reuse across the stream cipher layers.
+// This parameter exists for deterministic test vectors only. Callers should
+// normally use NewCipher, which uses crypto/rand. This intentionally weakened
+// package remains unsuitable for production regardless of RNG choice.
 func NewCipherWithRng(passphrase []byte, salt []byte, version Version, rng RandomnessGenerator, functionThatPrintsUglyWarnings func(), isProduction func() bool) (*Cipher, error) {
 	functionThatPrintsUglyWarnings()
 	if isProduction() {
@@ -146,35 +163,59 @@ func NewCipherWithRng(passphrase []byte, salt []byte, version Version, rng Rando
 	if versionParams, ok = versionParamsLookup[version]; !ok {
 		return nil, fmt.Errorf("Not a valid version")
 	}
-	return &Cipher{passphrase, salt, nil, versionParams, rng}, nil
+	// Cipher owns its sensitive inputs so that callers can safely reuse or
+	// scrub their buffers without changing cached key-derivation state.
+	return &Cipher{bytes.Clone(passphrase), bytes.Clone(salt), nil, versionParams, rng}, nil
 }
 
+// Scrub zeros out sensitive key material in the Cipher.
+//
+// Callers should defer this after creating a Cipher to ensure key material
+// is cleared from memory. Due to Go's garbage collector and stack copying,
+// this is best-effort and cannot guarantee that all copies are removed.
 func (c *Cipher) Scrub() {
 	scrub(c.passphrase)
 	scrub(c.derivedKey)
 }
 
+// SetSalt replaces the Cipher's salt with a copy of the first SaltLen bytes.
 func (c *Cipher) SetSalt(salt []byte) error {
 	if len(salt) < SaltLen {
 		return fmt.Errorf("need salt of at least %d bytes", SaltLen)
 	}
-	c.salt = salt[0:SaltLen]
+	newSalt := salt[0:SaltLen]
+	if bytes.Equal(c.salt, newSalt) {
+		return nil
+	}
+	c.derivedKey = nil
+	// Decrypt passes a view into the caller's ciphertext. Retaining that view
+	// would let later caller mutations bypass cache invalidation.
+	c.salt = bytes.Clone(newSalt)
 	return nil
 }
 
+// GetSalt returns a copy of the Cipher's salt. If the Cipher has no salt, it
+// generates and stores one before returning the copy.
 func (c *Cipher) GetSalt() ([]byte, error) {
 	if c.salt != nil {
-		return c.salt, nil
+		return bytes.Clone(c.salt), nil
 	}
 	c.salt = make([]byte, SaltLen)
 	_, err := c.rng.Read(c.salt)
 	if err != nil {
 		return nil, err
 	}
-	return c.salt, nil
+	return bytes.Clone(c.salt), nil
 }
 
 func (c *Cipher) DeriveKey(extra int) ([]byte, []byte, error) {
+	if extra < 0 {
+		return nil, nil, fmt.Errorf("extra must be non-negative, got %d", extra)
+	}
+	if extra > MaxDeriveKeyExtra {
+		return nil, nil, fmt.Errorf("extra must not exceed %d bytes, got %d", MaxDeriveKeyExtra, extra)
+	}
+
 	dkLen := c.versionParams.DkLen + extra
 
 	if c.derivedKey == nil || len(c.derivedKey) < dkLen {
@@ -196,16 +237,19 @@ func (c *Cipher) DeriveKey(extra int) ([]byte, []byte, error) {
 		}
 		c.derivedKey = dk
 	}
-	return c.derivedKey[0:c.versionParams.DkLen], c.derivedKey[c.versionParams.DkLen:], nil
+	extraEnd := c.versionParams.DkLen + extra
+	return c.derivedKey[0:c.versionParams.DkLen], c.derivedKey[c.versionParams.DkLen:extraEnd], nil
 }
 
 // MagicBytes are the four bytes prefixed to every TripleSec
 // ciphertext, 1c 94 d7 de.
 var MagicBytes = [4]byte{0x1c, 0x94, 0xd7, 0xde}
 
-// Encrypt encrypts and signs a plaintext message with TripleSec using a random
-// salt and the Cipher passphrase. The dst buffer size must be at least len(src)
-// + Overhead. dst and src can not overlap. src is left untouched.
+// Encrypt encrypts and signs a plaintext message with TripleSec using the
+// Cipher's salt and passphrase. If the Cipher was created without a salt, one
+// is generated on its first use and retained for later calls. The dst buffer
+// size must be at least len(src) + Overhead. dst and src can not overlap. src
+// is left untouched.
 //
 // Encrypt returns a error on memory or RNG failures.
 func (c *Cipher) Encrypt(src []byte) (dst []byte, err error) {
@@ -301,6 +345,7 @@ func encryptData(plain, keys []byte, rng RandomnessGenerator, versionParams Vers
 	// Salsa20
 	// For some reason salsa20 API is different
 	keyArray := new([32]byte)
+	defer scrub(keyArray[:])
 	copy(keyArray[:], keys[len(keys)-cipherOffset-CipherKeyLen:])
 	cipherOffset += CipherKeyLen
 	salsa20.XORKeyStream(res[ivOffset:], plain, salsaIV, keyArray)
@@ -330,7 +375,7 @@ func encryptData(plain, keys []byte, rng RandomnessGenerator, versionParams Vers
 	ivOffset -= len(aesIV)
 
 	if ivOffset != 0 {
-		return nil, CorruptionError{"something went terribly wrong during encryption: ivOffset final value non-zero"}
+		return nil, CorruptionError{msg: "something went terribly wrong during encryption: ivOffset final value non-zero"}
 	}
 
 	return res, nil
@@ -366,12 +411,12 @@ func generateMACs(data, keys []byte, versionParams VersionParams) []byte {
 // authentication fails or on memory failures.
 func (c *Cipher) Decrypt(src []byte) (res []byte, err error) {
 	if len(src) < len(MagicBytes)+VersionBytesLen {
-		err = CorruptionError{"decryption underrun"}
+		err = CorruptionError{msg: "decryption underrun"}
 		return
 	}
 
 	if !bytes.Equal(src[:len(MagicBytes)], MagicBytes[0:]) {
-		err = CorruptionError{"wrong magic bytes"}
+		err = CorruptionError{msg: "wrong magic bytes"}
 		return
 	}
 
@@ -379,32 +424,54 @@ func (c *Cipher) Decrypt(src []byte) (res []byte, err error) {
 	var version Version
 	err = binary.Read(vB, binary.BigEndian, &version)
 	if err != nil {
-		err = CorruptionError{err.Error()}
+		err = CorruptionError{msg: err.Error()}
 		return
 	}
 
 	versionParams, ok := versionParamsLookup[version]
 	if !ok {
-		return nil, VersionError{version}
+		return nil, VersionError{v: version}
 	}
 
-	err = c.SetSalt(src[8:24])
+	if len(src) < versionParams.Overhead() {
+		err = CorruptionError{msg: fmt.Sprintf("ciphertext too short: got %d bytes, need at least %d", len(src), versionParams.Overhead())}
+		return
+	}
+
+	headerLen := len(MagicBytes) + VersionBytesLen + SaltLen
+	err = c.SetSalt(src[len(MagicBytes)+VersionBytesLen : headerLen])
 	if err != nil {
 		return
 	}
 
-	dk, _, err := c.DeriveKey(0)
+	// Derive enough material for the ciphertext's version even when the Cipher
+	// was constructed with a version that uses a shorter derived key.
+	extraBytes := 0
+	if versionParams.DkLen > c.versionParams.DkLen {
+		extraBytes = versionParams.DkLen - c.versionParams.DkLen
+	}
+	if extraBytes > maxCrossVersionKeyExtra {
+		return nil, fmt.Errorf("unsupported cross-version key length difference: %d", extraBytes)
+	}
+
+	_, _, err = c.DeriveKey(extraBytes)
 	if err != nil {
 		return
 	}
-	macKeys := dk[:c.versionParams.TotalMacKeyLen]
-	cipherKeys := dk[c.versionParams.TotalMacKeyLen:]
+	fullKey := c.derivedKey[:versionParams.DkLen]
+	macKeys := fullKey[:versionParams.TotalMacKeyLen]
+	cipherKeys := fullKey[versionParams.TotalMacKeyLen:]
 
-	macs := src[24 : 24+64*2]
-	encryptedData := src[24+64*2:]
+	macEnd := headerLen + versionParams.TotalMacLen
+	if len(src) < macEnd {
+		err = CorruptionError{msg: "decryption underrun"}
+		return
+	}
+	macs := src[headerLen:macEnd]
+	encryptedData := src[macEnd:]
 
-	authenticatedData := make([]byte, 0, 24+len(encryptedData))
-	authenticatedData = append(authenticatedData, src[:24]...)
+	authenticatedData := make([]byte, 0, headerLen+len(encryptedData))
+	authenticatedData = append(authenticatedData, src[:headerLen]...)
 	authenticatedData = append(authenticatedData, encryptedData...)
 
 	if !hmac.Equal(macs, generateMACs(authenticatedData, macKeys, versionParams)) {
@@ -460,11 +527,12 @@ func decryptData(dst, data, keys []byte, versionParams VersionParams) error {
 	ivOffset += SalsaIVLen
 	iv = buffer[ivOffset-SalsaIVLen : ivOffset]
 	keyArray := new([32]byte)
+	defer scrub(keyArray[:])
 	copy(keyArray[:], keys[cipherOffset:cipherOffset+CipherKeyLen])
 	salsa20.XORKeyStream(dst, buffer[ivOffset:], iv, keyArray)
 
 	if len(buffer[ivOffset:]) != len(data)-versionParams.TotalIVLen {
-		return CorruptionError{"something went terribly wrong during decryption: buffer size is wrong"}
+		return CorruptionError{msg: "something went terribly wrong during decryption: buffer size is wrong"}
 	}
 
 	return nil
